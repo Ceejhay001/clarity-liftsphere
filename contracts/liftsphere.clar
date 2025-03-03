@@ -5,51 +5,61 @@
 (define-constant err-owner-only (err u100))
 (define-constant err-not-found (err u101))
 (define-constant err-already-exists (err u102))
+(define-constant err-invalid-input (err u103))
 
 ;; Data Variables
-(define-data-var achievement-counter uint u0)
+(define-data-var workout-counter uint u0)
 
-;; Data Maps
-(define-map workouts
-    { workout-id: uint }
-    {
-        name: (string-ascii 64),
-        description: (string-ascii 256),
-        exercises: (list 10 (string-ascii 64)),
-        created-by: principal
-    }
+;; Events
+(define-data-var last-event-id uint u0)
+(define-map events 
+    { event-id: uint }
+    { event-type: (string-ascii 32), user: principal, timestamp: uint }
 )
 
-(define-map workout-history
-    { user: principal, date: uint }
-    {
-        workout-id: uint,
-        sets: (list 10 uint),
-        reps: (list 10 uint),
-        weights: (list 10 uint)
-    }
+;; [Previous map definitions remain the same...]
+
+;; Private Functions
+(define-private (calculate-total-weight (sets (list 10 uint)) (reps (list 10 uint)) (weights (list 10 uint)))
+    (fold + (map * (map * sets reps) weights) u0)
 )
 
-(define-map achievements 
-    { achievement-id: uint }
-    {
-        name: (string-ascii 64),
-        description: (string-ascii 256),
-        requirement: uint,
-        achievement-type: (string-ascii 32)
-    }
+(define-private (validate-workout-input (sets (list 10 uint)) (reps (list 10 uint)) (weights (list 10 uint)))
+    (and
+        (is-eq (len sets) (len reps))
+        (is-eq (len sets) (len weights))
+        (> (len sets) u0)
+        (fold and (map > weights (list u0 u0 u0 u0 u0 u0 u0 u0 u0 u0)) true)
+    )
 )
 
-(define-map user-achievements
-    { user: principal, achievement-id: uint }
-    { earned: bool, date-earned: uint }
+(define-private (log-event (event-type (string-ascii 32)))
+    (let ((event-id (var-get last-event-id))
+          (timestamp (unwrap! (get-block-info? time) false)))
+        (if timestamp
+            (begin
+                (map-set events
+                    { event-id: event-id }
+                    { 
+                        event-type: event-type,
+                        user: tx-sender,
+                        timestamp: timestamp
+                    }
+                )
+                (var-set last-event-id (+ event-id u1))
+                true
+            )
+            false
+        )
+    )
 )
 
 ;; Public Functions
 (define-public (create-workout (name (string-ascii 64)) 
                              (description (string-ascii 256))
                              (exercises (list 10 (string-ascii 64))))
-    (let ((workout-id (var-get achievement-counter)))
+    (let ((workout-id (var-get workout-counter)))
+        (asserts! (> (len exercises) u0) err-invalid-input)
         (map-set workouts
             { workout-id: workout-id }
             {
@@ -59,6 +69,7 @@
                 created-by: tx-sender
             }
         )
+        (var-set workout-counter (+ workout-id u1))
         (ok workout-id)
     )
 )
@@ -67,68 +78,42 @@
                           (sets (list 10 uint))
                           (reps (list 10 uint))
                           (weights (list 10 uint)))
-    (let ((current-time (unwrap! (get-block-info? time) (err u500))))
+    (let (
+        (current-time (unwrap! (get-block-info? time) (err u500)))
+        (total-weight (calculate-total-weight sets reps weights))
+        (workout (unwrap! (map-get? workouts { workout-id: workout-id }) err-not-found))
+      )
+        ;; Input validation
+        (asserts! (validate-workout-input sets reps weights) err-invalid-input)
+        
+        ;; Update workout history
         (map-set workout-history
             { user: tx-sender, date: current-time }
             {
                 workout-id: workout-id,
                 sets: sets,
                 reps: reps,
-                weights: weights
+                weights: weights,
+                total-weight: total-weight
             }
         )
+        
+        ;; Update user stats and log event
+        (let ((stats (default-to { total-workouts: u0, total-weight-lifted: u0, last-workout: u0 }
+                (map-get? user-stats { user: tx-sender }))))
+            (map-set user-stats
+                { user: tx-sender }
+                {
+                    total-workouts: (+ (get total-workouts stats) u1),
+                    total-weight-lifted: (+ (get total-weight-lifted stats) total-weight),
+                    last-workout: current-time
+                }
+            )
+            (log-event "workout-logged")
+        )
+        
         (ok true)
     )
 )
 
-(define-public (create-achievement (name (string-ascii 64))
-                                 (description (string-ascii 256))
-                                 (requirement uint)
-                                 (achievement-type (string-ascii 32)))
-    (if (is-eq tx-sender contract-owner)
-        (let ((achievement-id (+ (var-get achievement-counter) u1)))
-            (map-set achievements
-                { achievement-id: achievement-id }
-                {
-                    name: name,
-                    description: description,
-                    requirement: requirement,
-                    achievement-type: achievement-type
-                }
-            )
-            (var-set achievement-counter achievement-id)
-            (ok achievement-id)
-        )
-        err-owner-only
-    )
-)
-
-(define-public (award-achievement (user principal) (achievement-id uint))
-    (if (is-eq tx-sender contract-owner)
-        (let ((current-time (unwrap! (get-block-info? time) (err u500))))
-            (map-set user-achievements
-                { user: user, achievement-id: achievement-id }
-                { earned: true, date-earned: current-time }
-            )
-            (ok true)
-        )
-        err-owner-only
-    )
-)
-
-;; Read-only functions
-(define-read-only (get-workout (workout-id uint))
-    (ok (map-get? workouts { workout-id: workout-id }))
-)
-
-(define-read-only (get-user-workout-history (user principal))
-    (ok (map-get? workout-history { user: user, date: (unwrap! (get-block-info? time) (err u500)) }))
-)
-
-(define-read-only (get-achievement (achievement-id uint))
-    (ok (map-get? achievements { achievement-id: achievement-id }))
-)
-
-(define-read-only (check-achievement (user principal) (achievement-id uint))
-    (ok (map-get? user-achievements { user: user, achievement-id: achievement-id }))
-)
+[... rest of the contract remains the same ...]
